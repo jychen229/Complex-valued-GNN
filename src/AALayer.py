@@ -11,7 +11,7 @@ class AngularAggLayer(nn.Module):
         self.labels = labels
         self.dropout = dropout
         num = int(num_class*(num_class-1)/2)
-        self.theta = nn.Parameter(torch.randn(num,))
+        self.theta = nn.Parameter(torch.zeros(num,))
         
     def pre_norm(self, features):
         max_values, _ = torch.max(features, dim=0)
@@ -19,14 +19,13 @@ class AngularAggLayer(nn.Module):
         new_fea = max_values * torch.cos(theta) + 1j*features*torch.sin(theta)
         return new_fea, max_values
     
-    # ! residual 
     def post_norm(self, features):
         feature_norm = torch.abs(features)
         unit_norm_result = features / feature_norm
         normalized_result = unit_norm_result * self.mag
         return normalized_result
     
-    # ! mayber trace the grad 
+    # ! maybe trace the grad 
     def negative_symmetric_theta(self):
         matrix = torch.zeros(self.k, self.k)
         triu_indices = torch.triu_indices(self.k, self.k, offset=1)  # 上三角
@@ -60,6 +59,7 @@ class AngularAggLayer(nn.Module):
         else:
             norm_features = x
             
+        raw = norm_features
         self.mean_tensor = self.get_centers(norm_features, self.labels)
         
         #self.restr_theta()
@@ -67,10 +67,11 @@ class AngularAggLayer(nn.Module):
         
         fake_label = self.get_label(norm_features)
         A_hat = self.generate_matrix(matrix, fake_label)
-        A = torch.where(A > 0, torch.tensor(1), A)
+        A = torch.where(A > 0, torch.tensor(1.0), A)
         A = torch.mul(A, A_hat)
         adj = torch.cos(A)+1j*torch.sin(A)
-        return self.post_norm(torch.matmul(adj, norm_features))
+        message = torch.matmul(adj, norm_features)
+        return self.post_norm(raw+message)
         
 
 def complex_dist(c1,c2,p=1):
@@ -84,6 +85,63 @@ def complex_dist(c1,c2,p=1):
     complex_distances = torch.sqrt(real_distances**2 + imaginary_distances**2)
 
     return complex_distances
+
+
+class CGNN(nn.Module):
+    def __init__(self, nfeat, nlayers, nhidden, nclass, dropout, labels, num_nodes):
+        super(CGNN, self).__init__()
+        self.convs = nn.ModuleList()
+        for _ in range(nlayers):
+            self.convs.append(AngularAggLayer(num_nodes, nclass, nhidden, labels, dropout))
+        self.fcs = nn.ModuleList()
+        self.fcs.append(nn.Linear(nfeat, nhidden))
+        self.fcs.append(nn.Linear(nhidden, nclass))
+        self.params1 = list(self.convs.parameters())
+        self.params2 = list(self.fcs.parameters())
+        self.act_fn = nn.ReLU()
+        self.dropout = dropout
+        
+    def complex_relu(self, input):
+        return F.relu(input.real).type(torch.complex64)+1j*F.relu(input.imag).type(torch.complex64)
+
+    def forward(self, x, adj):
+        _layers = []
+        x = F.dropout(x, self.dropout, training=self.training)
+        layer_inner = self.act_fn(self.fcs[0](x))
+        _layers.append(layer_inner)
+        for i,con in enumerate(self.convs):
+            if i ==0:
+            #layer_inner = F.dropout(layer_inner, self.dropout, training=self.training)
+                layer_inner = self.complex_relu(con(layer_inner,adj,True))
+            else:
+                layer_inner = self.complex_relu(con(layer_inner,adj))
+
+        #layer_inner = F.dropout(layer_inner, self.dropout, training=self.training)
+        #--------#
+        layer_inner = torch.angle(layer_inner)                   
+        layer_inner = self.fcs[-1](layer_inner)
+        return F.log_softmax(layer_inner, dim=1)
+        
+
+class ComplexDropout(nn.Module):
+    def __init__(self, p=0.5):
+        super(ComplexDropout,self).__init__()
+        self.p = p
+        
+    def complex_dropout(self, input, p=0.5, training=True):
+        # need to have the same dropout mask for real and imaginary part, 
+        device = input.device
+        mask = torch.ones(input.real.shape, dtype = torch.float32, device = device)
+        mask = F.dropout(mask, p, training)*1/(1-p)
+        mask.type(input.real.dtype)
+        real,imag = mask * input.real,mask * input.imag
+        return torch.complex(real,imag)
+
+    def forward(self,input):
+        if self.training:
+            return self.complex_dropout(input,self.p)
+        else:
+            return input
 
 
 #---------- To Do --------------
