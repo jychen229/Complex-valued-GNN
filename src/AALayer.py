@@ -52,6 +52,38 @@ class AngularAggLayer(nn.Module):
         label_indices = label.long()
         A_hat = w[label_indices.unsqueeze(1), label_indices.unsqueeze(0)]
         return A_hat
+
+    def get_label_pro(self, feature, mean_tensor):
+        '''
+        soft-attention
+        '''
+        N = feature.shape[0]
+        d = feature.shape[1] 
+        k = mean_tensor.shape[0]
+
+        fea_repeated_in_chunks = feature.repeat_interleave(N, dim=0)
+        fea_repeated_alternating = feature.repeat(N, 1)
+        all_combinations_matrix = torch.cat([fea_repeated_in_chunks, fea_repeated_alternating], dim=1)
+        feature = all_combinations_matrix.view(N*N, 2*d)
+
+        feature_1 = torch.matmul(feature ,torch.complex(self.w_real_1, self.w_imag_1)) #N*N,d
+        feature_2 = torch.matmul(feature ,torch.complex(self.w_real_2, self.w_imag_2)) #N*N,d
+
+        #  inner product
+        first_part = torch.matmul(feature_1.unsqueeze(1), mean_tensor.unsqueeze(0).transpose(1, 2))
+        second_part = torch.matmul(feature_2.unsqueeze(1), mean_tensor.unsqueeze(0).transpose(1, 2))
+
+        first_inner_product = torch.real(first_part) + torch.imag(first_part)
+        second_inner_product = torch.real(second_part) + torch.imag(second_part)
+
+        i_index = torch.argmax(first_inner_product, dim=1)
+        j_index = torch.argmax(second_inner_product, dim=1)
+
+        return i_index.view(N,N), j_index.view(N,N)
+    
+    def generate_matrix_pro(self, X, Y, w):
+        A_hat = w[X, Y]
+        return A_hat
     
     def forward(self, x, A, l0=False):
         if l0:
@@ -144,38 +176,28 @@ class ComplexDropout(nn.Module):
             return input
 
 
-#---------- To Do --------------
 
-#complex distance  
-def get_label_pro(feature, mean_tensor):
+
+
+
+def Augular_loss(y_true, theta, m, s):
     '''
-    GAT pattern 
+    m: maybe try 0.5 first
+    s: 1.0  if over-fit, reduce; vice-versa 
     '''
-    N = feature.shape[0]
-    d = feature.shape[1] 
-    k = mean_tensor.shape[0]
-    
-    fea_repeated_in_chunks = feature.repeat_interleave(N, dim=0)
-    fea_repeated_alternating = feature.repeat(N, 1)
-    all_combinations_matrix = torch.cat([fea_repeated_in_chunks, fea_repeated_alternating], dim=1)
-    feature = all_combinations_matrix.view(N, N, 2*d)
-    
-    first_part = feature[:, :, :d]
-    second_part = feature[:, :, d:]
+    # replace 0 => 1 and 1 => m in y_true
+    M = (m - 1) * y_true + 1
 
-    dist_first = complex_dist(first_part.reshape(N*N, d),mean_tensor.reshape(k, d))
-    dist_second = complex_dist(second_part.reshape(N*N, d),mean_tensor.reshape(k, d))
+    # add appropriate margin to theta
+    new_theta = theta + M
+    new_cos_theta = torch.cos(new_theta)
 
-    # 获取前d维和后d维最接近的两个类别索引
-    closest_first = torch.argmin(dist_first, dim=1)
-    closest_second = torch.argmin(dist_second, dim=1)
+    # re-scale the cosines by a hyper-parameter s
+    y_pred = s * new_cos_theta
 
-    return closest_first.view(N,N), closest_second.view(N,N)
+    # the following part is the same as softmax loss
+    numerators = torch.sum(y_true * torch.exp(y_pred), dim=1)
+    denominators = torch.sum(torch.exp(y_pred), dim=1)
+    loss = -torch.sum(torch.log(numerators / denominators))
 
-
-
-
-#loss coa m *theta  -n
-
-def Augular_loss():
-    pass
+    return loss
